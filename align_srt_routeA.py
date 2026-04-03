@@ -31,14 +31,14 @@ os.environ["PATH"] = str(ffmpeg_exe.parent) + os.pathsep + os.environ.get("PATH"
 
 import whisperx
 
-AUDIO_DIR  = Path("/root/文字时间轴对齐案例【raw】")
+AUDIO_DIR  = Path("/root")
 OUTPUT_DIR = Path("/root/aligned_routeA")
 DEVICE     = "cuda"
 LANGUAGE   = "es"
 
 # wav2vec2 单段最大处理时长（秒）。超出则分块对齐。
 # 路线A 把全段文本放进一个 segment，若音频过长会 OOM，按此分块。
-MAX_CHUNK_DURATION = 300.0   # 5 分钟，一般单段远小于此
+MAX_CHUNK_DURATION = 1800.0  # 30 分钟，确保单段音频整体处理
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -130,6 +130,118 @@ def extract_words(aligned_result):
                     "end":   w["end"],
                 })
     return words
+
+
+# ──────────────────── 后处理：词速异常值守门员 v2 ─────────────────
+
+def _load_vad_model_safe():
+    """尝试加载 Silero-VAD，失败则返回 None（触发 RMS fallback）"""
+    try:
+        from silero_vad import load_silero_vad
+        model = load_silero_vad()
+        print("  Silero-VAD 加载成功")
+        return model
+    except Exception as e:
+        print(f"  Silero-VAD 加载失败 ({e})，将使用 RMS 兜底")
+        return None
+
+
+def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
+                        min_move_s=1.5,
+                        min_words_per_sec=1.3,
+                        min_suspect_duration=6.0):
+    """
+    词速异常值守门员：只修正词速异常低的字幕行（场景转场早开始）。
+
+    触发条件（两者同时满足）：
+      1. 词数 / 时长 < min_words_per_sec（正常说话 2-4 词/秒，低于此为可疑）
+      2. 时长 > min_suspect_duration（短行豁免，避免误判慢语速行）
+
+    检测到可疑行后，在该行时间窗口 [orig_start + min_move_s, orig_end] 内
+    搜索第一个 VAD / RMS 语音起点，吸附过去。
+    """
+    # 预计算 VAD 时间段（一次性，全音频）
+    speech_ts = None
+    if vad_model is not None:
+        try:
+            import torch
+            from silero_vad import get_speech_timestamps
+            audio_tensor = torch.from_numpy(audio).float()
+            speech_ts = get_speech_timestamps(
+                audio_tensor, vad_model,
+                sampling_rate=sr,
+                return_seconds=True,
+            )
+        except Exception as e:
+            print(f"  VAD 时间段提取失败 ({e})，使用 RMS")
+
+    # 预计算 RMS（VAD 失败时的 fallback）
+    rms_data = None
+    if speech_ts is None:
+        import numpy as np
+        frame_ms  = 20
+        frame_len = int(sr * frame_ms / 1000)
+        n_frames  = len(audio) // frame_len
+        if n_frames > 0:
+            rms = np.array([
+                np.sqrt(np.mean(audio[i * frame_len:(i + 1) * frame_len] ** 2))
+                for i in range(n_frames)
+            ])
+            ref_level = np.percentile(rms, 70)
+            rms_data  = (rms, ref_level * 0.15, frame_ms / 1000.0)
+
+    snapped = 0
+    result  = []
+    for i, seg in enumerate(segments):
+        orig_start = seg["start"]
+        orig_end   = seg["end"]
+        duration   = orig_end - orig_start
+        word_count = len(normalize_for_dp(seg["text"]))
+        prev_end   = segments[i - 1]["end"] if i > 0 else None
+
+        # 判断是否可疑（三个条件同时满足）：
+        #   1. 词速过低（被拉伸到了静音段里）
+        #   2. 时长足够长
+        #   3. 与上一行之间只有极小间隔（clamping留下的50ms缝），
+        #      说明对齐器是被迫紧接上一行，而非自然找到的起点。
+        #      如果前面有自然间隔（>0.3s），则起点是可信的，不动。
+        gap_to_prev = (orig_start - prev_end) if prev_end is not None else 999.0
+        is_suspect = (
+            word_count >= 3
+            and duration >= min_suspect_duration
+            and word_count / duration < min_words_per_sec
+            and gap_to_prev < 0.3
+        )
+
+        if not is_suspect:
+            result.append(seg)
+            continue
+
+        # 在 [orig_start + min_move_s, orig_end] 内搜索语音起点
+        search_from = orig_start + min_move_s
+        new_start   = orig_start
+
+        if speech_ts is not None:
+            for sp in speech_ts:
+                if sp["start"] >= search_from and sp["start"] <= orig_end:
+                    new_start = sp["start"]
+                    snapped  += 1
+                    break
+        elif rms_data is not None:
+            rms, threshold, frame_dur = rms_data
+            f_from = int(search_from / frame_dur)
+            f_end  = int(orig_end   / frame_dur)
+            for f in range(f_from, min(f_end, len(rms))):
+                if rms[f] >= threshold:
+                    new_start = f * frame_dur
+                    snapped  += 1
+                    break
+
+        result.append({**seg, "start": new_start})
+
+    print(f"  词速异常修正: {snapped} 行起点被吸附"
+          f"（触发阈值: <{min_words_per_sec} 词/秒 且时长 >{min_suspect_duration}s）")
+    return result
 
 
 # ──────────────────────────── DP 对齐 ────────────────────────────
@@ -236,7 +348,7 @@ def build_segments_from_srt(srt_lines, audio_duration):
     return segs
 
 
-def process_file(audio_path, srt_path, align_model, metadata):
+def process_file(audio_path, srt_path, align_model, metadata, vad_model=None):
     print(f"\n处理: {audio_path.name}")
 
     srt_lines = parse_srt(srt_path)
@@ -275,6 +387,9 @@ def process_file(audio_path, srt_path, align_model, metadata):
     output_segments = match_srt_to_words_dp(srt_lines, words)
     print(f"  映射完成: {len(output_segments)} 条")
 
+    # 后处理：异常值守门员（只修正起点比实际语音早超过1.5秒的行）
+    output_segments = snap_outlier_starts(output_segments, audio, vad_model=vad_model)
+
     return output_segments
 
 
@@ -292,7 +407,10 @@ def main():
         language_code=LANGUAGE,
         device=DEVICE,
     )
-    print("模型加载完成！\n")
+    print("模型加载完成！")
+    print("加载 VAD 模型（静音检测）...")
+    vad_model = _load_vad_model_safe()
+    print()
 
     for audio_path in audio_files:
         stem     = audio_path.stem
@@ -302,7 +420,7 @@ def main():
             continue
 
         try:
-            segments = process_file(audio_path, srt_path, align_model, metadata)
+            segments = process_file(audio_path, srt_path, align_model, metadata, vad_model=vad_model)
             out_path = OUTPUT_DIR / f"{stem}.aligned.srt"
             write_srt(segments, out_path)
             print(f"  已保存: {out_path.name}")
