@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -37,6 +38,11 @@ AUDIO_DIR  = Path("/root")
 OUTPUT_DIR = Path("/root/aligned_routeB")
 DEVICE     = "cuda"
 LANGUAGE   = "es"
+LANG_CONFIG = {
+    "es": {"name": "Spanish"},
+    "fr": {"name": "French"},
+    "ru": {"name": "Russian"},
+}
 
 # ── faster-whisper 配置 ─────────────────────────────────────────
 # 本地模型路径（AutoDL 环境下预缓存），留空则自动从 HuggingFace 下载
@@ -45,12 +51,22 @@ WHISPER_MODEL_SIZE = "large-v3"
 WHISPER_COMPUTE_TYPE = "float16"
 
 # ── LLM 配置（AiHubMix + Qwen）──────────────────────────────────
-LLM_API_KEY  = os.environ.get("LLM_API_KEY", "")    # 从环境变量读取，避免泄露到公开仓库
+LLM_API_KEY  = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aihubmix.com/v1")
 LLM_MODEL    = "qwen3.6-plus"
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS  = 2000
 LLM_MAX_RETRIES = 3
+LLM_TIMEOUT     = 120.0  # 秒
+
+# API key 校验：空 key 直接报错，别带着空 key 静默跑几十批才发现
+if not LLM_API_KEY:
+    print("[错误] LLM_API_KEY 未设置，请通过环境变量指定。")
+    print("  示例: export LLM_API_KEY=\"your-key-here\"")
+    raise SystemExit(1)
+
+# 全局复用 client，避免每次调用重复初始化
+_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=LLM_TIMEOUT)
 
 # ── 对齐参数 ────────────────────────────────────────────────────
 SM_HIGH_CONF = 0.40      # SequenceMatcher 置信度阈值，高于此直接采用
@@ -104,8 +120,10 @@ def write_srt(segments, out_path):
 
 
 def normalize(text):
-    """文本规范化：小写 + 去标点 + 去多余空格"""
+    """文本规范化：小写 + Unicode 归一化 + 去标点 + 去多余空格"""
     text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     text = re.sub(r'[^\w\s]', '', text, flags=re.UNICODE)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -151,11 +169,11 @@ def transcribe(model, audio_path):
 
 def filter_hallucinations(segs):
     """过滤重复幻觉段（与近期 segment 高度相似的视为幻觉）"""
+    norms = [normalize(s["text"]) for s in segs]  # 预计算，避免 lookback 重复归一化
     clean = []
     for i, seg in enumerate(segs):
-        seg_norm = normalize(seg["text"])
         is_hall = any(
-            sim(seg_norm, normalize(segs[j]["text"])) > HALL_SIM
+            sim(norms[i], norms[j]) > HALL_SIM
             for j in range(max(0, i - HALL_LOOKBACK), i)
         )
         if not is_hall:
@@ -215,10 +233,9 @@ def sm_align(segs, sentences):
 
 def call_llm(prompt):
     """调用 LLM，带重试机制"""
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            resp = client.chat.completions.create(
+            resp = _client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=LLM_TEMPERATURE,
@@ -240,11 +257,14 @@ def llm_align_batch(segs, sentence_batch):
 
     返回 {句子序号: [起始S编号, 结束S编号]} 或 {}（解析失败）
     """
+    lang_cfg = LANG_CONFIG[LANGUAGE]
     segs_text = "\n".join(f"[S{i}] {s['text'].strip()}"
                           for i, s in enumerate(segs))
     sent_text = "\n".join(f"[{idx}] {text}" for idx, text in sentence_batch)
 
     prompt = f"""你是专业的语音对齐助手。你的任务是找出参考句子与音频转录段落之间的对应关系。
+
+本批文本语言为：{lang_cfg['name']}。
 
 【音频转录段落】（由语音识别生成，可能包含朗读口误、重复、漏读等）：
 {segs_text}
@@ -267,10 +287,18 @@ def llm_align_batch(segs, sentence_batch):
 
     response = call_llm(prompt)
     try:
+        # 匹配最外层 JSON 对象（贪婪匹配最后一个 }）
         m = re.search(r'\{[\s\S]*\}', response)
-        return json.loads(m.group()) if m else {}
-    except Exception as e:
-        print(f"    [LLM 解析失败] {e}")
+        if not m:
+            print(f"    [LLM 响应无 JSON] {response[:200]}")
+            return {}
+        result = json.loads(m.group())
+        if not isinstance(result, dict):
+            print(f"    [LLM 响应非 dict] 类型={type(result).__name__}")
+            return {}
+        return result
+    except json.JSONDecodeError as e:
+        print(f"    [LLM JSON 解析失败] {e}")
         return {}
 
 
@@ -370,13 +398,17 @@ def process_file(whisper_model, audio_path, srt_path):
 
 def main():
     # 查找音频文件
-    audio_files = sorted(AUDIO_DIR.glob("*.m4a"))
+    audio_files = sorted(
+        f for ext in ("*.m4a", "*.mp3", "*.wav", "*.flac")
+        for f in AUDIO_DIR.glob(ext)
+    )
     if not audio_files:
         print("未找到音频文件！")
         return
 
     print(f"找到 {len(audio_files)} 个音频文件")
-    print(f"语言: {LANGUAGE}")
+    lang_cfg = LANG_CONFIG[LANGUAGE]
+    print(f"语言: {LANGUAGE} ({lang_cfg['name']})")
     print(f"LLM: {LLM_MODEL}（{LLM_BASE_URL}）")
     print()
 
@@ -397,13 +429,14 @@ def main():
             continue
 
         try:
+            n_ref = len(parse_srt(srt_path))
             segments = process_file(whisper_model, audio_path, srt_path)
             if segments:
                 out_path = OUTPUT_DIR / f"{stem}.aligned.srt"
                 write_srt(segments, out_path)
                 print(f"  已保存: {out_path.name}")
                 total_aligned += len(segments)
-                total_sentences += len(parse_srt(srt_path))
+                total_sentences += n_ref
         except Exception as e:
             import traceback
             print(f"  失败: {e}")

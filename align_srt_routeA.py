@@ -14,20 +14,17 @@
 
 import os
 import re
-import sys
 import unicodedata
 from pathlib import Path
 
+try:
+    from num2words import num2words as _n2w
+    _HAS_NUM2WORDS = True
+except ImportError:
+    _HAS_NUM2WORDS = False
+
 os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface"
 os.environ["TORCH_HOME"] = "/root/autodl-tmp/torch"
-
-import shutil
-import imageio_ffmpeg
-ffmpeg_exe = Path(imageio_ffmpeg.get_ffmpeg_exe())
-ffmpeg_copy = ffmpeg_exe.parent / "ffmpeg.exe"
-if not ffmpeg_copy.exists():
-    shutil.copy(ffmpeg_exe, ffmpeg_copy)
-os.environ["PATH"] = str(ffmpeg_exe.parent) + os.pathsep + os.environ.get("PATH", "")
 
 import whisperx
 
@@ -35,10 +32,15 @@ AUDIO_DIR  = Path("/root")
 OUTPUT_DIR = Path("/root/aligned_routeA")
 DEVICE     = "cuda"
 LANGUAGE   = "es"
+LANG_CONFIG = {
+    "es": {"name": "Spanish", "align_model_name": None},
+    "fr": {"name": "French", "align_model_name": None},
+    "ru": {"name": "Russian", "align_model_name": "jonatasgrosman/wav2vec2-large-xlsr-53-russian"},
+}
 
-# wav2vec2 单段最大处理时长（秒）。超出则分块对齐。
-# 路线A 把全段文本放进一个 segment，若音频过长会 OOM，按此分块。
-MAX_CHUNK_DURATION = 1800.0  # 30 分钟，确保单段音频整体处理
+# wav2vec2 单段最大处理时长（秒）。超过此阈值才触发分块；
+# 典型录音均低于30分钟，整体作为一个 segment 处理。
+MAX_CHUNK_DURATION = 1800.0  # 30 分钟
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -80,42 +82,15 @@ def write_srt(segments, out_path):
 
 
 def normalize_for_dp(text):
-    """规范化文本为词序列，连字符拆为空格，数字展开为西语读法"""
-    try:
-        from num2words import num2words as _n2w
-        text = re.sub(r'\b\d+\b', lambda m: _n2w(int(m.group()), lang='es'), text)
-    except Exception:
-        pass
+    """规范化文本为词序列，连字符拆为空格，数字展开为对应语言读法"""
+    if _HAS_NUM2WORDS:
+        text = re.sub(r'\b\d+\b', lambda m: _n2w(int(m.group()), lang=LANGUAGE), text)
     text = text.lower()
     text = text.replace("-", " ")
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     text = re.sub(r"[^\w\s]", "", text)
     return text.split()
-
-
-def levenshtein(a, b):
-    la, lb = len(a), len(b)
-    dp = list(range(lb + 1))
-    for i in range(1, la + 1):
-        prev, dp[0] = dp[0], i
-        for j in range(1, lb + 1):
-            temp = dp[j]
-            if a[i-1] == b[j-1]:
-                dp[j] = prev
-            else:
-                dp[j] = 1 + min(prev, dp[j], dp[j-1])
-            prev = temp
-    return dp[lb]
-
-
-def fuzzy_match(a, b, threshold=0.40):
-    if a == b:
-        return True
-    max_len = max(len(a), len(b))
-    if max_len == 0:
-        return True
-    return levenshtein(a, b) / max_len <= threshold
 
 
 def extract_words(aligned_result):
@@ -183,10 +158,8 @@ def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
         frame_len = int(sr * frame_ms / 1000)
         n_frames  = len(audio) // frame_len
         if n_frames > 0:
-            rms = np.array([
-                np.sqrt(np.mean(audio[i * frame_len:(i + 1) * frame_len] ** 2))
-                for i in range(n_frames)
-            ])
+            frames    = audio[:n_frames * frame_len].reshape(n_frames, frame_len)
+            rms       = np.sqrt((frames ** 2).mean(axis=1))
             ref_level = np.percentile(rms, 70)
             rms_data  = (rms, ref_level * 0.15, frame_ms / 1000.0)
 
@@ -396,17 +369,26 @@ def process_file(audio_path, srt_path, align_model, metadata, vad_model=None):
 # ──────────────────────────── 主入口 ─────────────────────────────
 
 def main():
-    audio_files = sorted(AUDIO_DIR.glob("*.m4a"))
+    audio_files = sorted(
+        f for ext in ("*.m4a", "*.mp3", "*.wav", "*.flac")
+        for f in AUDIO_DIR.glob(ext)
+    )
     if not audio_files:
         print("未找到音频文件！")
-        sys.exit(1)
+        return
 
     print(f"找到 {len(audio_files)} 个音频文件")
-    print("加载对齐模型（西语 wav2vec2）...")
-    align_model, metadata = whisperx.load_align_model(
-        language_code=LANGUAGE,
-        device=DEVICE,
-    )
+    lang_cfg = LANG_CONFIG[LANGUAGE]
+    print(f"语言: {LANGUAGE} ({lang_cfg['name']})")
+    print(f"对齐模型: {lang_cfg['align_model_name'] or 'WhisperX default'}")
+    print("加载对齐模型...")
+    load_kwargs = {
+        "language_code": LANGUAGE,
+        "device": DEVICE,
+    }
+    if lang_cfg["align_model_name"]:
+        load_kwargs["model_name"] = lang_cfg["align_model_name"]
+    align_model, metadata = whisperx.load_align_model(**load_kwargs)
     print("模型加载完成！")
     print("加载 VAD 模型（静音检测）...")
     vad_model = _load_vad_model_safe()
