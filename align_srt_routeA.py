@@ -15,7 +15,9 @@
 import os
 import re
 import unicodedata
+from bisect import bisect_left
 from pathlib import Path
+import argparse
 
 try:
     from num2words import num2words as _n2w
@@ -31,7 +33,7 @@ import whisperx
 AUDIO_DIR  = Path("/root")
 OUTPUT_DIR = Path("/root/aligned_routeA")
 DEVICE     = "cuda"
-LANGUAGE   = "es"
+LANGUAGE   = "ru"
 LANG_CONFIG = {
     "es": {"name": "Spanish", "align_model_name": None},
     "fr": {"name": "French", "align_model_name": None},
@@ -49,7 +51,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 def parse_srt(srt_path):
     """解析 SRT，只取文字，忽略原始时间戳"""
-    text = Path(srt_path).read_text(encoding="utf-8")
+    text = Path(srt_path).read_text(encoding="utf-8-sig")
     blocks = re.split(r"\n\n+", text.strip())
     segments = []
     for block in blocks:
@@ -137,6 +139,7 @@ def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
     """
     # 预计算 VAD 时间段（一次性，全音频）
     speech_ts = None
+    vad_starts = None
     if vad_model is not None:
         try:
             import torch
@@ -147,6 +150,7 @@ def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
                 sampling_rate=sr,
                 return_seconds=True,
             )
+            vad_starts = [sp["start"] for sp in speech_ts]
         except Exception as e:
             print(f"  VAD 时间段提取失败 ({e})，使用 RMS")
 
@@ -194,12 +198,11 @@ def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
         search_from = orig_start + min_move_s
         new_start   = orig_start
 
-        if speech_ts is not None:
-            for sp in speech_ts:
-                if sp["start"] >= search_from and sp["start"] <= orig_end:
-                    new_start = sp["start"]
-                    snapped  += 1
-                    break
+        if vad_starts is not None:
+            idx = bisect_left(vad_starts, search_from)
+            if idx < len(vad_starts) and vad_starts[idx] <= orig_end:
+                new_start = vad_starts[idx]
+                snapped  += 1
         elif rms_data is not None:
             rms, threshold, frame_dur = rms_data
             f_from = int(search_from / frame_dur)
@@ -220,22 +223,35 @@ def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
 # ──────────────────────────── DP 对齐 ────────────────────────────
 
 def dp_align(srt_seq, asr_seq):
-    """LCS 全局对齐（与 8 号相同）"""
+    """LCS 全局对齐，用 bytearray 存方向节省内存"""
     N, M = len(srt_seq), len(asr_seq)
-    dp = [[0] * (M + 1) for _ in range(N + 1)]
+    # 方向矩阵：0=对角(匹配), 1=上, 2=左 — 每格 1 字节而非 28 字节
+    # 行优先存储：direction[i * (M+1) + j]
+    direction = bytearray((N + 1) * (M + 1))
+    # DP 值只需保留两行（滚动数组）
+    prev = [0] * (M + 1)
+    curr = [0] * (M + 1)
     for i in range(1, N + 1):
         for j in range(1, M + 1):
             if srt_seq[i-1][0] == asr_seq[j-1][0]:
-                dp[i][j] = dp[i-1][j-1] + 1
+                curr[j] = prev[j-1] + 1
+                direction[i * (M + 1) + j] = 0  # 对角
+            elif prev[j] >= curr[j-1]:
+                curr[j] = prev[j]
+                direction[i * (M + 1) + j] = 1  # 上
             else:
-                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+                curr[j] = curr[j-1]
+                direction[i * (M + 1) + j] = 2  # 左
+        prev, curr = curr, [0] * (M + 1)
+    # 回溯
     pairs = []
     i, j = N, M
     while i > 0 and j > 0:
-        if srt_seq[i-1][0] == asr_seq[j-1][0] and dp[i][j] == dp[i-1][j-1] + 1:
+        d = direction[i * (M + 1) + j]
+        if d == 0:
             pairs.append((i-1, j-1))
             i -= 1; j -= 1
-        elif dp[i-1][j] >= dp[i][j-1]:
+        elif d == 1:
             i -= 1
         else:
             j -= 1
@@ -272,15 +288,43 @@ def match_srt_to_words_dp(srt_lines, words):
             line_first[line_idx] = asr_word_idx
         line_last[line_idx] = asr_word_idx
 
-    result = []
+    # 第一遍：标记已对齐 / 未对齐
+    raw = []
     for i, line in enumerate(srt_lines):
         if i in line_first:
             seg_start = words[line_first[i]]["start"]
             seg_end   = words[line_last[i]]["end"]
-            result.append({"start": seg_start, "end": seg_end, "text": line})
+            raw.append({"start": seg_start, "end": seg_end, "text": line, "_aligned": True})
         else:
-            prev_end = result[-1]["end"] if result else 0
-            result.append({"start": prev_end, "end": prev_end + 0.5, "text": line})
+            raw.append({"text": line, "_aligned": False})
+
+    # 第二遍：连续未对齐行按文字长度比例分配前后已对齐行之间的时间
+    result = []
+    i = 0
+    while i < len(raw):
+        if raw[i]["_aligned"]:
+            result.append({"start": raw[i]["start"], "end": raw[i]["end"], "text": raw[i]["text"]})
+            i += 1
+        else:
+            # 收集连续未对齐行
+            gap_start = i
+            while i < len(raw) and not raw[i]["_aligned"]:
+                i += 1
+            gap_end = i  # 不含
+
+            # 确定时间边界
+            t_left  = result[-1]["end"] if result else 0
+            t_right = raw[i]["start"] if i < len(raw) else (t_left + 0.5 * (gap_end - gap_start))
+
+            # 按文字长度比例分配
+            lengths = [max(len(raw[j]["text"]), 1) for j in range(gap_start, gap_end)]
+            total_len = sum(lengths)
+            span = t_right - t_left
+            cursor = t_left
+            for k, j in enumerate(range(gap_start, gap_end)):
+                share = span * lengths[k] / total_len
+                result.append({"start": cursor, "end": cursor + share, "text": raw[j]["text"]})
+                cursor += share
 
     # 事后钳制：强制每行在下一行开始前 50ms 结束
     for i in range(len(result) - 1):
@@ -369,6 +413,22 @@ def process_file(audio_path, srt_path, align_model, metadata, vad_model=None):
 # ──────────────────────────── 主入口 ─────────────────────────────
 
 def main():
+    global LANGUAGE, AUDIO_DIR, OUTPUT_DIR
+
+    parser = argparse.ArgumentParser(description="路线A：SRT 文本直接 CTC 对齐")
+    parser.add_argument("--lang", default=LANGUAGE, choices=LANG_CONFIG.keys(),
+                        help=f"语言代码 (默认: {LANGUAGE})")
+    parser.add_argument("--audio-dir", default=str(AUDIO_DIR),
+                        help=f"音频目录 (默认: {AUDIO_DIR})")
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR),
+                        help=f"输出目录 (默认: {OUTPUT_DIR})")
+    args = parser.parse_args()
+
+    LANGUAGE   = args.lang
+    AUDIO_DIR  = Path(args.audio_dir)
+    OUTPUT_DIR = Path(args.output_dir)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
     audio_files = sorted(
         f for ext in ("*.m4a", "*.mp3", "*.wav", "*.flac")
         for f in AUDIO_DIR.glob(ext)

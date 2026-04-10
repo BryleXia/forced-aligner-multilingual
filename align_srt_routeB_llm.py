@@ -37,7 +37,7 @@ from openai import OpenAI
 AUDIO_DIR  = Path("/root")
 OUTPUT_DIR = Path("/root/aligned_routeB")
 DEVICE     = "cuda"
-LANGUAGE   = "es"
+LANGUAGE   = "ru"
 LANG_CONFIG = {
     "es": {"name": "Spanish"},
     "fr": {"name": "French"},
@@ -50,22 +50,15 @@ WHISPER_MODEL_PATH = ""  # 例如 "/root/autodl-tmp/huggingface/hub/models--Syst
 WHISPER_MODEL_SIZE = "large-v3"
 WHISPER_COMPUTE_TYPE = "float16"
 
-# ── LLM 配置（AiHubMix + Qwen）──────────────────────────────────
+# ── LLM 配置（DashScope + Qwen）─────────────────────────────────
 LLM_API_KEY  = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aihubmix.com/v1")
+LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_MODEL    = "qwen3.6-plus"
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS  = 2000
 LLM_MAX_RETRIES = 3
 LLM_TIMEOUT     = 120.0  # 秒
 
-# API key 校验：空 key 直接报错，别带着空 key 静默跑几十批才发现
-if not LLM_API_KEY:
-    print("[错误] LLM_API_KEY 未设置，请通过环境变量指定。")
-    print("  示例: export LLM_API_KEY=\"your-key-here\"")
-    raise SystemExit(1)
-
-# 全局复用 client，避免每次调用重复初始化
 _client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=LLM_TIMEOUT)
 
 # ── 对齐参数 ────────────────────────────────────────────────────
@@ -240,6 +233,7 @@ def call_llm(prompt):
                 messages=[{"role": "user", "content": prompt}],
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
+                extra_body={"enable_thinking": False},
             )
             return resp.choices[0].message.content
         except Exception as e:
