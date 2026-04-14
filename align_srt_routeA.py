@@ -125,7 +125,7 @@ def _load_vad_model_safe():
 
 def snap_outlier_starts(segments, audio, vad_model=None, sr=16000,
                         min_move_s=1.5,
-                        min_words_per_sec=1.3,
+                        min_words_per_sec=1.5,
                         min_suspect_duration=6.0):
     """
     词速异常值守门员：只修正词速异常低的字幕行（场景转场早开始）。

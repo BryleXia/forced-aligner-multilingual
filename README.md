@@ -5,7 +5,7 @@
 > 方案 A 在 5 段纪录片音频（390 条字幕，约 56 分钟）上经过人工逐句审听，**0 条错误**；在 5 段俄语纪录片（1028 词）上自动匹配率达 **98.8%**。
 
 **作者：** BryleXia · 北京第二外国语学院欧洲学院
-**核心脚本：** `align_srt_routeA.py`（方案 A）、`align_srt_routeB_llm.py`（方案 B）、`align_srt_routeC_hybrid.py`（方案 C）
+**核心脚本：** `align_srt_routeA.py`（方案 A）、`align_srt_routeA_multi.py`（方案 A 并行版）、`align_srt_routeB_llm.py`（方案 B）、`align_srt_routeC_hybrid.py`（方案 C）
 **里程碑标签：** `v13-milestone`
 
 ---
@@ -94,7 +94,7 @@ wav2vec2 返回词级时间戳，再用 LCS 动态规划映射回每一行字幕
 
 在场景切换（长时间静音）的地方，CTC 对齐器有时会把下一句字幕的起点放得过早。同时满足以下三个条件时触发修正：
 
-1. **词速低于 1.3 词/秒**（正常语速 2~4 词/秒）
+1. **词速低于 1.5 词/秒**（正常语速 2~4 词/秒）
 2. **时长超过 6 秒**
 3. **与前一句间隔小于 0.3 秒**（被强行塞进去的标志）
 
@@ -118,6 +118,23 @@ wav2vec2 返回词级时间戳，再用 LCS 动态规划映射回每一行字幕
 - **命令行参数**：支持 `--lang`、`--audio-dir`、`--output-dir`，不用改代码
 - **DP 内存优化**：LCS 动态规划用 `bytearray` 存方向矩阵，内存减少约 96%
 - **VAD 搜索加速**：用二分查找（`bisect`）替代线性遍历
+
+### 多进程并行版（align_srt_routeA_multi.py）
+
+生产环境中每次任务通常包含 5+ 对音频-SRT 文件。原脚本串行处理，GPU 利用率极低（wav2vec2 仅 ~1.2GB，RTX 5090 的 32GB 显存大量闲置）。
+
+并行版每个子进程独立加载模型，多个文件同时跑：
+
+```
+进程1: [加载 wav2vec2] → 处理 seg001
+进程2: [加载 wav2vec2] → 处理 seg002
+进程3: [加载 wav2vec2] → 处理 seg003
+...                               （5 × 1.2GB ≈ 6GB，显存绰绰有余）
+```
+
+- 5 个文件并行 → 总耗时接近单个最慢文件的耗时，加速比 ~4-5x
+- 自动匹配两种 SRT 命名格式：`*_tgt.asr.qc.srt`（生产格式）和 `*.asr.qc.srt`（原格式）
+- 核心逻辑全部复用 `align_srt_routeA.py`，零重复代码
 
 ---
 
@@ -271,18 +288,27 @@ pip install faster-whisper openai
 
 ### 2. 准备文件
 
-三套方案共享相同的输入格式，支持 `.m4a`、`.mp3`、`.wav`、`.flac` 音频格式：
+三套方案共享相同的输入格式，支持 `.m4a`、`.mp3`、`.wav`、`.flac` 音频格式。支持两种 SRT 命名：
 
 ```
+格式一（原格式）:
 /root/
 ├── seg001.m4a
-├── seg001.asr.qc.srt   ← 已质检的字幕文本
+├── seg001.asr.qc.srt
 ├── seg002.mp3
 ├── seg002.asr.qc.srt
 └── ...
+
+格式二（生产格式）:
+/root/
+├── es_tour_serv_0004_seg001.m4a
+├── es_tour_serv_0004_seg001_tgt.asr.qc.srt
+├── es_tour_serv_0004_seg002.m4a
+├── es_tour_serv_0004_seg002_tgt.asr.qc.srt
+└── ...
 ```
 
-音频与字幕文件的 **文件名主名必须一致**（仅扩展名不同）。
+并行版（`routeA_multi`）自动识别两种格式；原脚本（`routeA`）仅支持格式一。
 
 ### 3. 运行
 
@@ -301,6 +327,18 @@ python align_srt_routeA.py --lang ru --audio-dir /root/audio --output-dir /root/
 ```
 
 输出目录：`/root/aligned_routeA/`
+
+**方案 A 并行版（5+ 文件时推荐）：**
+
+```bash
+# 5 个进程同时跑，充分利用 GPU
+python align_srt_routeA_multi.py --lang es --audio-dir /root/input --output-dir /root/aligned_routeA --workers 5
+
+# 调整并行数
+python align_srt_routeA_multi.py --lang ru --audio-dir /root/audio --output-dir /root/output --workers 3
+```
+
+输出目录与原脚本一致。运行结束自动打印加速比。
 
 **方案 B（口误较多时使用）：**
 
@@ -327,7 +365,8 @@ python align_srt_routeC_hybrid.py
 ### 4. 工作流建议
 
 1. **优先用方案 A**——速度快、不依赖外部 API、对齐质量已验证
-2. **发现口误/漏读/多读时切换方案 B**——LLM 能理解语义偏差
+2. **文件多时用并行版**——`align_srt_routeA_multi.py`，5+ 文件加速 ~4-5x
+3. **发现口误/漏读/多读时切换方案 B**——LLM 能理解语义偏差
 3. **B 覆盖不全时用方案 C**——锚点+CTC 混合，兼顾 B 的容错和 A 的精度
 4. **对比验证**：`diff /root/aligned/xxx.aligned.srt /root/aligned_routeA/xxx.aligned.srt`
 
